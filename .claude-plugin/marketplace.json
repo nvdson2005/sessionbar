@@ -1,0 +1,15 @@
+{
+  "name": "sessionbar",
+  "owner": {
+    "name": "nvdson2005"
+  },
+  "description": "Menu bar status for all active Claude Code sessions on macOS",
+  "plugins": [
+    {
+      "name": "sessionbar",
+      "source": "./plugin",
+      "description": "Records each Claude Code session's state for the sessionbar macOS menu bar status.",
+      "version": "0.1.0"
+    }
+  ]
+}

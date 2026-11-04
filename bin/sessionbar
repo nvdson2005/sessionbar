@@ -1,0 +1,216 @@
+#!/bin/bash
+# sessionbar — macOS menu bar status for active Claude Code sessions.
+#
+# The Claude Code plugin (hooks) writes one JSON file per session into
+# $STATE_DIR. This CLI reads those files for the terminal (`status`) and for
+# SwiftBar (`swiftbar`), and wires everything up (`setup`).
+set -euo pipefail
+
+VERSION="0.1.0"
+STATE_DIR="${SESSIONBAR_DIR:-$HOME/.local/state/sessionbar}"
+STALE_SECS="${SESSIONBAR_STALE_SECS:-43200}" # drop sessions without a PID after 12h
+MARKETPLACE_SOURCE="${SESSIONBAR_MARKETPLACE:-nvdson2005/sessionbar}"
+MARKETPLACE_NAME="sessionbar"
+PLUGIN_ID="sessionbar@sessionbar"
+SWIFTBAR_PLUGIN_NAME="sessionbar.3s.sh"
+
+die() { echo "sessionbar: $*" >&2; exit 1; }
+need_jq() { command -v jq >/dev/null 2>&1 || die "jq not found (brew install jq)"; }
+
+usage() {
+  cat <<EOF
+sessionbar $VERSION — menu bar status for active Claude Code sessions
+
+Usage:
+  sessionbar setup [SWIFTBAR_PLUGIN_DIR]  Install the Claude Code plugin + SwiftBar plugin
+  sessionbar status [--json]              List active sessions in the terminal
+  sessionbar clean                        Remove sessions whose process is gone
+  sessionbar doctor                       Check the installation
+  sessionbar uninstall                    Remove the plugins and all session state
+  sessionbar swiftbar                     Render SwiftBar output (used by the menu bar)
+  sessionbar --version
+
+Environment:
+  SESSIONBAR_DIR          State folder (default: ~/.local/state/sessionbar)
+  SESSIONBAR_STALE_SECS   Max age for sessions without a known PID (default: 43200)
+  SESSIONBAR_MARKETPLACE  Marketplace source for setup (default: $MARKETPLACE_SOURCE)
+EOF
+}
+
+# Folder holding swiftbar/<wrapper>: Homebrew layout (share/sessionbar) or repo checkout.
+share_dir() {
+  local self root d
+  self=$(realpath "${BASH_SOURCE[0]}")
+  root=$(cd "$(dirname "$self")/.." && pwd)
+  for d in "$root/share/sessionbar" "$root"; do
+    if [ -f "$d/swiftbar/$SWIFTBAR_PLUGIN_NAME" ]; then echo "$d"; return; fi
+  done
+  die "cannot find swiftbar/$SWIFTBAR_PLUGIN_NAME under $root"
+}
+
+swiftbar_dir() {
+  local dir
+  dir=$(defaults read com.ameba.SwiftBar PluginDirectory 2>/dev/null || true)
+  echo "${dir/#\~/$HOME}"
+}
+
+is_claude_alive() {
+  local comm
+  comm=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
+  case "${comm##*/}" in [Cc]laude*) return 0 ;; *) return 1 ;; esac
+}
+
+# Remove state files for dead sessions. -q: quiet.
+cmd_clean() {
+  [ -d "$STATE_DIR" ] || return 0
+  local now f pid upd removed=0
+  now=$(date +%s)
+  shopt -s nullglob
+  for f in "$STATE_DIR"/*.json; do
+    if ! read -r pid upd < <(jq -r '"\(.pid // 0) \(.updated_at // 0)"' "$f" 2>/dev/null); then
+      rm -f "$f"; removed=$((removed + 1)); continue # unreadable
+    fi
+    if [ "$pid" -gt 0 ] 2>/dev/null; then
+      is_claude_alive "$pid" || { rm -f "$f"; removed=$((removed + 1)); }
+    elif [ $((now - upd)) -gt "$STALE_SECS" ]; then
+      rm -f "$f"; removed=$((removed + 1))
+    fi
+  done
+  [ "${1:-}" = "-q" ] || echo "removed $removed stale session(s)"
+}
+
+# All sessions as a JSON array, most urgent first.
+sessions_json() {
+  shopt -s nullglob
+  local files=("$STATE_DIR"/*.json)
+  if [ ${#files[@]} -eq 0 ]; then echo '[]'; return; fi
+  jq -s '
+    def rank: {"waiting": 0, "working": 1, "idle": 2}[.state] // 3;
+    map(select(type == "object" and .session_id)) | sort_by(rank, -(.updated_at // 0))
+  ' "${files[@]}" 2>/dev/null || echo '[]'
+}
+
+JQ_HELPERS='
+  def ago: ($now - .) as $s
+    | if $s < 60 then "\($s)s" elif $s < 3600 then "\($s / 60 | floor)m" else "\($s / 3600 | floor)h" end;
+  def project: (.cwd // "") | split("/") | map(select(. != "")) | last // "?";
+  def state_label: {"waiting": "Needs input", "working": "Working", "idle": "Idle"}[.state] // .state;
+'
+
+cmd_status() {
+  need_jq
+  cmd_clean -q
+  local json
+  json=$(sessions_json)
+  if [ "${1:-}" = "--json" ]; then echo "$json"; return; fi
+  jq -r --argjson now "$(date +%s)" "$JQ_HELPERS"'
+    if length == 0 then "No active Claude sessions"
+    else .[] | [state_label, project, ((.updated_at // $now) | ago), (.detail // ""), .cwd] | @tsv
+    end
+  ' <<<"$json" | column -t -s $'\t'
+}
+
+cmd_swiftbar() {
+  need_jq
+  cmd_clean -q
+  local json self
+  json=$(sessions_json)
+  self=$(command -v sessionbar 2>/dev/null || realpath "${BASH_SOURCE[0]}")
+  jq -r --argjson now "$(date +%s)" --arg self "$self" "$JQ_HELPERS"'
+    def clean: tostring | gsub("[|\r\n]"; " ");
+    def q: "\"" + (tostring | gsub("\""; "\\\"")) + "\"";
+    def icon: {"waiting": "exclamationmark.bubble.fill", "working": "sparkle", "idle": "moon.zzz"}[.state] // "questionmark.circle";
+    def color: {"waiting": "#FF9F0A", "working": "#30D158", "idle": "#8E8E93"}[.state] // "#8E8E93";
+
+    (map(select(.state == "waiting")) | length) as $w
+    | (map(select(.state == "working")) | length) as $k
+    | length as $n
+    | (if $n == 0 then " | sfimage=sparkle sfcolor=#8E8E93"
+       elif $w > 0 then "\($w)/\($n) | sfimage=exclamationmark.bubble.fill sfcolor=#FF9F0A"
+       elif $k > 0 then "\($k)/\($n) | sfimage=sparkle sfcolor=#30D158"
+       else "\($n) | sfimage=moon.zzz"
+       end),
+      "---",
+      (if $n == 0 then "No active Claude sessions | color=#8E8E93"
+       else .[] | (
+         "\(project | clean) — \(state_label)\(if (.detail // "") != "" then " · " + (.detail | clean) else "" end) (\((.updated_at // $now) | ago)) | sfimage=\(icon) sfcolor=\(color)",
+         "--\(.cwd | clean) | color=#8E8E93 size=11",
+         "--Open in Terminal | bash=/usr/bin/open param1=-a param2=Terminal param3=\(.cwd | q) terminal=false",
+         "--Open in Finder | bash=/usr/bin/open param1=\(.cwd | q) terminal=false",
+         "--Session \(.session_id[0:8]) | color=#8E8E93 size=11 font=Menlo"
+       )
+       end),
+      "---",
+      "Clean up stale sessions | bash=\($self | q) param1=clean terminal=false refresh=true",
+      "Refresh | refresh=true"
+  ' <<<"$json"
+}
+
+cmd_setup() {
+  need_jq
+  command -v claude >/dev/null 2>&1 || die "claude CLI not found in PATH"
+  local src dir
+  src="$(share_dir)/swiftbar/$SWIFTBAR_PLUGIN_NAME"
+  dir="${1:-$(swiftbar_dir)}"
+
+  if [ -z "$dir" ]; then
+    echo "! SwiftBar plugin folder not set. Install SwiftBar (brew install --cask swiftbar),"
+    echo "  open it once, choose a plugin folder, then re-run: sessionbar setup"
+  else
+    mkdir -p "$dir"
+    install -m 755 "$src" "$dir/$SWIFTBAR_PLUGIN_NAME"
+    echo "✓ SwiftBar plugin installed: $dir/$SWIFTBAR_PLUGIN_NAME"
+  fi
+
+  echo "→ Adding Claude Code marketplace: $MARKETPLACE_SOURCE"
+  claude plugin marketplace add "$MARKETPLACE_SOURCE" || echo "  (marketplace may already be added; continuing)"
+  echo "→ Installing Claude Code plugin: $PLUGIN_ID"
+  claude plugin install "$PLUGIN_ID" || die "plugin install failed"
+
+  open -g "swiftbar://refreshallplugins" 2>/dev/null || true
+  echo "✓ Done. Restart running Claude Code sessions so they load the hooks."
+}
+
+cmd_uninstall() {
+  local dir
+  dir=$(swiftbar_dir)
+  if [ -n "$dir" ] && [ -f "$dir/$SWIFTBAR_PLUGIN_NAME" ]; then
+    rm -f "$dir/$SWIFTBAR_PLUGIN_NAME"
+    echo "✓ Removed SwiftBar plugin"
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    claude plugin uninstall "$PLUGIN_ID" || true
+    claude plugin marketplace remove "$MARKETPLACE_NAME" || true
+  fi
+  rm -rf "$STATE_DIR"
+  echo "✓ Removed session state ($STATE_DIR)"
+  echo "  To remove the CLI too: brew uninstall sessionbar"
+}
+
+cmd_doctor() {
+  local ok=1 dir n
+  check() { if eval "$2" >/dev/null 2>&1; then echo "✓ $1"; else echo "✗ $1${3:+ — $3}"; ok=0; fi; }
+  check "jq installed" "command -v jq" "brew install jq"
+  check "claude CLI installed" "command -v claude"
+  check "SwiftBar installed" "[ -d /Applications/SwiftBar.app ] || [ -d \"$HOME/Applications/SwiftBar.app\" ]" "brew install --cask swiftbar"
+  dir=$(swiftbar_dir)
+  check "SwiftBar plugin folder set" "[ -n \"$dir\" ]" "open SwiftBar and choose a folder"
+  check "SwiftBar plugin installed" "[ -x \"$dir/$SWIFTBAR_PLUGIN_NAME\" ]" "sessionbar setup"
+  check "Claude Code plugin installed" "claude plugin list 2>/dev/null | grep -q sessionbar" "sessionbar setup"
+  n=0
+  [ -d "$STATE_DIR" ] && n=$(find "$STATE_DIR" -name '*.json' | wc -l | tr -d ' ')
+  echo "  state folder: $STATE_DIR ($n session file(s))"
+  [ "$ok" = 1 ]
+}
+
+case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  clean) cmd_clean ;;
+  swiftbar) cmd_swiftbar ;;
+  doctor) cmd_doctor ;;
+  uninstall) cmd_uninstall ;;
+  -v | --version | version) echo "sessionbar $VERSION" ;;
+  "" | -h | --help | help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
