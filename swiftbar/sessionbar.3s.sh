@@ -1,6 +1,6 @@
 #!/bin/bash
 # <xbar.title>Claude Sessions</xbar.title>
-# <xbar.version>v0.1.0</xbar.version>
+# <xbar.version>v0.2.0</xbar.version>
 # <xbar.author>nvdson2005</xbar.author>
 # <xbar.desc>Status of all active Claude Code sessions</xbar.desc>
 # <xbar.dependencies>jq,sessionbar</xbar.dependencies>

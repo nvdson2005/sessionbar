@@ -9,7 +9,7 @@
       "name": "sessionbar",
       "source": "./plugin",
       "description": "Records each Claude Code session's state for the sessionbar macOS menu bar status.",
-      "version": "0.1.0"
+      "version": "0.2.0"
     }
   ]
 }

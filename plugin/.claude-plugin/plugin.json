@@ -1,6 +1,6 @@
 {
   "name": "sessionbar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Records each Claude Code session's state (working, waiting, idle) for the sessionbar macOS menu bar status.",
   "author": { "name": "nvdson2005" },
   "homepage": "https://github.com/nvdson2005/sessionbar",

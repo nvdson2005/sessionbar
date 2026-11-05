@@ -6,13 +6,16 @@
 # SwiftBar (`swiftbar`), and wires everything up (`setup`).
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 STATE_DIR="${SESSIONBAR_DIR:-$HOME/.local/state/sessionbar}"
+CONFIG_FILE="${SESSIONBAR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sessionbar/config}"
 STALE_SECS="${SESSIONBAR_STALE_SECS:-43200}" # drop sessions without a PID after 12h
 MARKETPLACE_SOURCE="${SESSIONBAR_MARKETPLACE:-nvdson2005/sessionbar}"
 MARKETPLACE_NAME="sessionbar"
 PLUGIN_ID="sessionbar@sessionbar"
 SWIFTBAR_PLUGIN_NAME="sessionbar.3s.sh"
+MAX_DOTS=6
+US=$'\x1f' # field separator that survives empty fields (unlike tab)
 
 die() { echo "sessionbar: $*" >&2; exit 1; }
 need_jq() { command -v jq >/dev/null 2>&1 || die "jq not found (brew install jq)"; }
@@ -24,6 +27,10 @@ sessionbar $VERSION — menu bar status for active Claude Code sessions
 Usage:
   sessionbar setup [SWIFTBAR_PLUGIN_DIR]  Install the Claude Code plugin + SwiftBar plugin
   sessionbar status [--json]              List active sessions in the terminal
+  sessionbar focus <session_id>           Bring the session's terminal tab to the front
+  sessionbar open <session_id>            Open the session's folder in Finder
+  sessionbar config [notify|sound on|off] Show or change settings
+  sessionbar notify-test                  Send a test notification
   sessionbar clean                        Remove sessions whose process is gone
   sessionbar doctor                       Check the installation
   sessionbar uninstall                    Remove the plugins and all session state
@@ -32,6 +39,7 @@ Usage:
 
 Environment:
   SESSIONBAR_DIR          State folder (default: ~/.local/state/sessionbar)
+  SESSIONBAR_CONFIG       Config file (default: ~/.config/sessionbar/config)
   SESSIONBAR_STALE_SECS   Max age for sessions without a known PID (default: 43200)
   SESSIONBAR_MARKETPLACE  Marketplace source for setup (default: $MARKETPLACE_SOURCE)
 EOF
@@ -59,6 +67,44 @@ is_claude_alive() {
   comm=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
   case "${comm##*/}" in [Cc]laude*) return 0 ;; *) return 1 ;; esac
 }
+
+valid_sid() { case "$1" in "" | *[!A-Za-z0-9_-]*) return 1 ;; *) return 0 ;; esac; }
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+config_get() {
+  local v
+  v=$(grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2-) || true
+  echo "${v:-$2}"
+}
+
+cmd_config() {
+  case $# in
+    0)
+      echo "notify=$(config_get notify on)"
+      echo "sound=$(config_get sound on)"
+      ;;
+    2)
+      case "$1" in notify | sound) ;; *) die "unknown setting '$1' (use: notify, sound)" ;; esac
+      case "$2" in on | off) ;; *) die "value must be 'on' or 'off'" ;; esac
+      mkdir -p "$(dirname "$CONFIG_FILE")"
+      { grep -vE "^$1=" "$CONFIG_FILE" 2>/dev/null || true; echo "$1=$2"; } >"$CONFIG_FILE.tmp"
+      mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+      echo "$1=$2"
+      ;;
+    *) die "usage: sessionbar config [notify|sound on|off]" ;;
+  esac
+}
+
+cmd_notify_test() {
+  pgrep -xq SwiftBar || die "SwiftBar is not running (open -a SwiftBar)"
+  local silent=false
+  [ "$(config_get sound on)" = off ] && silent=true
+  open -g "swiftbar://notify?plugin=sessionbar&title=sessionbar&body=Notifications%20are%20working&silent=$silent"
+  echo "Sent. If nothing appeared, allow SwiftBar in System Settings → Notifications."
+}
+
+# ── session state ────────────────────────────────────────────────────────────
 
 # Remove state files for dead sessions. -q: quiet.
 cmd_clean() {
@@ -91,10 +137,21 @@ sessions_json() {
 }
 
 JQ_HELPERS='
-  def ago: ($now - .) as $s
-    | if $s < 60 then "\($s)s" elif $s < 3600 then "\($s / 60 | floor)m" else "\($s / 3600 | floor)h" end;
+  def dur: if . < 60 then "\(.)s" elif . < 3600 then "\(. / 60 | floor)m" else "\(. / 3600 | floor)h" end;
+  def ago: ($now - .) | if . < 0 then 0 else . end | dur;
+  # Age means: waiting for how long / working on this turn for how long / idle since.
+  def since: if .state == "waiting" then (.waiting_since // .updated_at)
+             elif .state == "working" then (.turn_started_at // .updated_at)
+             else .updated_at end;
+  def age: (since // $now) | ago;
   def project: (.cwd // "") | split("/") | map(select(. != "")) | last // "?";
   def state_label: {"waiting": "Needs input", "working": "Working", "idle": "Idle"}[.state] // .state;
+  def branch_label: (.branch // "") | if . == "" then "—" else . end;
+  def term_label:
+    (.term.app // "") as $a
+    | ({"iTerm.app": "iTerm2", "Apple_Terminal": "Terminal", "vscode": "VS Code", "WarpTerminal": "Warp",
+        "ghostty": "Ghostty", "tmux": "tmux", "WezTerm": "WezTerm"}[$a] // (if $a == "" then "unknown terminal" else $a end))
+      + (if .term.tmux then " (tmux)" else "" end);
 '
 
 cmd_status() {
@@ -105,7 +162,7 @@ cmd_status() {
   if [ "${1:-}" = "--json" ]; then echo "$json"; return; fi
   jq -r --argjson now "$(date +%s)" "$JQ_HELPERS"'
     if length == 0 then "No active Claude sessions"
-    else .[] | [state_label, project, ((.updated_at // $now) | ago), (.detail // ""), .cwd] | @tsv
+    else .[] | [state_label, project, branch_label, age, (.detail // ""), .cwd] | @tsv
     end
   ' <<<"$json" | column -t -s $'\t'
 }
@@ -113,38 +170,150 @@ cmd_status() {
 cmd_swiftbar() {
   need_jq
   cmd_clean -q
-  local json self
+  local json self notify sound
   json=$(sessions_json)
   self=$(command -v sessionbar 2>/dev/null || realpath "${BASH_SOURCE[0]}")
-  jq -r --argjson now "$(date +%s)" --arg self "$self" "$JQ_HELPERS"'
+  notify=$([ "$(config_get notify on)" = on ] && echo true || echo false)
+  sound=$([ "$(config_get sound on)" = on ] && echo true || echo false)
+  jq -r --argjson now "${SESSIONBAR_NOW:-$(date +%s)}" --arg self "$self" --argjson max "$MAX_DOTS" \
+    --argjson notify "$notify" --argjson sound "$sound" "$JQ_HELPERS"'
     def clean: tostring | gsub("[|\r\n]"; " ");
     def q: "\"" + (tostring | gsub("\""; "\\\"")) + "\"";
+    def pad($n): tostring
+      | if length > $n then .[0:$n - 1] + "…" elif length < $n then . + (" " * ($n - length)) else . end;
+    def ansi($c): "\u001b[38;5;\($c)m" + . + "\u001b[0m";
     def icon: {"waiting": "exclamationmark.bubble.fill", "working": "sparkle", "idle": "moon.zzz"}[.state] // "questionmark.circle";
     def color: {"waiting": "#FF9F0A", "working": "#30D158", "idle": "#8E8E93"}[.state] // "#8E8E93";
+    # Waiting > 2 min: the dot blinks (alternates each refresh) to nudge you.
+    def dot:
+      if .state == "waiting" then
+        (if ($now - (.waiting_since // $now)) > 120 and (($now / 3 | floor) % 2 == 1) then "○" else "●" end) | ansi(214)
+      elif .state == "working" then "●" | ansi(42)
+      else "●" | ansi(245) end;
+    def focus_action: "bash=\($self | q) param1=focus param2=\(.session_id) terminal=false";
+    def tip: "\(.cwd | clean)\\n\(state_label)\(if (.detail // "") != "" then ": " + (.detail | clean) else "" end)\\nBranch: \(branch_label) · \(term_label)\\nClick: jump to tab · ⌥-click: open folder";
+    def row:
+      ((project | clean | pad(18)) + "  " + (branch_label | clean | pad(14)) + "  "
+        + ((.detail // "") | clean | pad(28)) + "  " + (age | pad(4))) as $label
+      | "\($label) | font=Menlo size=12 sfimage=\(icon) sfcolor=\(color) \(focus_action) tooltip=\(tip | q)",
+        "\($label) | font=Menlo size=12 sfimage=folder sfcolor=\(color) alternate=true bash=\($self | q) param1=open param2=\(.session_id) terminal=false tooltip=\(.cwd | clean | q)";
+    def group($state; $title):
+      map(select(.state == $state)) as $g
+      | if ($g | length) > 0 then "\($title) (\($g | length)) | size=11 color=#8E8E93", ($g[] | row) else empty end;
+    def toggle($label; $key; $on):
+      "\($label) | bash=\($self | q) param1=config param2=\($key) param3=\(if $on then "off" else "on" end) terminal=false refresh=true checked=\($on)";
 
-    (map(select(.state == "waiting")) | length) as $w
-    | (map(select(.state == "working")) | length) as $k
-    | length as $n
+    length as $n
     | (if $n == 0 then " | sfimage=sparkle sfcolor=#8E8E93"
-       elif $w > 0 then "\($w)/\($n) | sfimage=exclamationmark.bubble.fill sfcolor=#FF9F0A"
-       elif $k > 0 then "\($k)/\($n) | sfimage=sparkle sfcolor=#30D158"
-       else "\($n) | sfimage=moon.zzz"
+       else (.[0:$max] | map(dot) | join(" "))
+         + (if $n > $max then " " + ("+\($n - $max)" | ansi(245)) else "" end)
+         + " | ansi=true"
        end),
       "---",
       (if $n == 0 then "No active Claude sessions | color=#8E8E93"
-       else .[] | (
-         "\(project | clean) — \(state_label)\(if (.detail // "") != "" then " · " + (.detail | clean) else "" end) (\((.updated_at // $now) | ago)) | sfimage=\(icon) sfcolor=\(color)",
-         "--\(.cwd | clean) | color=#8E8E93 size=11",
-         "--Open in Terminal | bash=/usr/bin/open param1=-a param2=Terminal param3=\(.cwd | q) terminal=false",
-         "--Open in Finder | bash=/usr/bin/open param1=\(.cwd | q) terminal=false",
-         "--Session \(.session_id[0:8]) | color=#8E8E93 size=11 font=Menlo"
-       )
+       else group("waiting"; "NEEDS YOU"), group("working"; "WORKING"), group("idle"; "IDLE")
        end),
       "---",
+      (if $n > 0 then
+         "\($n) session\(if $n == 1 then "" else "s" end) · oldest \(map(.started_at // $now) | min | ago) | size=11 color=#8E8E93"
+       else empty end),
+      toggle("Notify when a session needs you"; "notify"; $notify),
+      (if $notify then toggle("Notification sound"; "sound"; $sound) else empty end),
       "Clean up stale sessions | bash=\($self | q) param1=clean terminal=false refresh=true",
       "Refresh | refresh=true"
   ' <<<"$json"
 }
+
+# ── focus: bring the session's terminal tab to the front ─────────────────────
+
+focus_iterm() {
+  osascript - "$1" "$2" <<'APPLESCRIPT'
+on run argv
+  set theTTY to item 1 of argv
+  set theID to item 2 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (theID is not "" and unique id of s is theID) or (theTTY is not "" and tty of s is theTTY) then
+            select w
+            tell t to select
+            tell s to select
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+APPLESCRIPT
+}
+
+focus_terminal() {
+  osascript - "$1" <<'APPLESCRIPT'
+on run argv
+  set theTTY to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if tty of t is theTTY then
+          set selected of t to true
+          set index of w to 1
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+APPLESCRIPT
+}
+
+cmd_focus() {
+  need_jq
+  local sid=${1:-} f app bundle tty iterm cwd result=""
+  valid_sid "$sid" || die "usage: sessionbar focus <session_id>"
+  f="$STATE_DIR/$sid.json"
+  [ -f "$f" ] || die "no such session: $sid"
+  IFS=$US read -r app bundle tty iterm cwd < <(
+    jq -r '[.term.app // "", .term.bundle // "", .term.tty // "", .term.iterm_session // "", .cwd // ""] | join("\u001f")' "$f"
+  )
+
+  case "$app" in
+    iTerm.app) result=$(focus_iterm "$tty" "$iterm" 2>&1) || true ;;
+    Apple_Terminal) [ -n "$tty" ] && { result=$(focus_terminal "$tty" 2>&1) || true; } ;;
+  esac
+  [ "$result" = ok ] && return 0
+  case "$result" in *"-1743"* | *"Not authorized"*)
+    echo "sessionbar: allow SwiftBar to control your terminal in System Settings → Privacy & Security → Automation" >&2 ;;
+  esac
+
+  # Fallbacks: editors open the session's folder window; anything else just activates.
+  if [ -n "$bundle" ]; then
+    case "$app" in
+      vscode) open -b "$bundle" "$cwd" ;;
+      *) open -b "$bundle" ;;
+    esac
+  elif [ -n "$cwd" ] && [ -d "$cwd" ]; then
+    open -a Terminal "$cwd"
+  fi
+}
+
+cmd_open() {
+  need_jq
+  local sid=${1:-} f cwd
+  valid_sid "$sid" || die "usage: sessionbar open <session_id>"
+  f="$STATE_DIR/$sid.json"
+  [ -f "$f" ] || die "no such session: $sid"
+  cwd=$(jq -r '.cwd // ""' "$f")
+  [ -n "$cwd" ] && [ -d "$cwd" ] || die "folder not found: $cwd"
+  open "$cwd"
+}
+
+# ── install / maintenance ────────────────────────────────────────────────────
 
 cmd_setup() {
   need_jq
@@ -193,6 +362,7 @@ cmd_doctor() {
   check "jq installed" "command -v jq" "brew install jq"
   check "claude CLI installed" "command -v claude"
   check "SwiftBar installed" "[ -d /Applications/SwiftBar.app ] || [ -d \"$HOME/Applications/SwiftBar.app\" ]" "brew install --cask swiftbar"
+  check "SwiftBar running" "pgrep -xq SwiftBar" "open -a SwiftBar"
   dir=$(swiftbar_dir)
   check "SwiftBar plugin folder set" "[ -n \"$dir\" ]" "open SwiftBar and choose a folder"
   check "SwiftBar plugin installed" "[ -x \"$dir/$SWIFTBAR_PLUGIN_NAME\" ]" "sessionbar setup"
@@ -200,12 +370,17 @@ cmd_doctor() {
   n=0
   [ -d "$STATE_DIR" ] && n=$(find "$STATE_DIR" -name '*.json' | wc -l | tr -d ' ')
   echo "  state folder: $STATE_DIR ($n session file(s))"
+  echo "  settings: notify=$(config_get notify on) sound=$(config_get sound on)"
   [ "$ok" = 1 ]
 }
 
 case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
   status) shift; cmd_status "$@" ;;
+  focus) shift; cmd_focus "$@" ;;
+  open) shift; cmd_open "$@" ;;
+  config) shift; cmd_config "$@" ;;
+  notify-test) cmd_notify_test ;;
   clean) cmd_clean ;;
   swiftbar) cmd_swiftbar ;;
   doctor) cmd_doctor ;;

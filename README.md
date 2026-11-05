@@ -3,17 +3,27 @@
 macOS menu bar status for every active Claude Code session: which ones are **working**, which **need your input** (permission prompts), and which are **idle**.
 
 ```
- ⚠ 1/3                     ← menu bar title: sessions needing input / total
- ─────────────────────────
- ⚠ api-server — Needs input · Claude needs your permission to use Bash (12s)
- ✦ web-app — Working · Edit (3s)
- ☾ notes — Idle · Done (8m)
- ─────────────────────────
+ ● ● ●                       ← one dot per session: orange = needs you, green = working, grey = idle
+ ──────────────────────────────────────────────────────────────
+ NEEDS YOU (1)
+ ⚠ api-server   main        Claude needs your permission…   12s
+ WORKING (1)
+ ✦ web-app      feat/ui     Edit                            3m
+ IDLE (1)
+ ☾ notes        —           Done                            8m
+ ──────────────────────────────────────────────────────────────
+ 3 sessions · oldest 2h
+ ✓ Notify when a session needs you
+ ✓ Notification sound
  Clean up stale sessions
  Refresh
 ```
 
-Each session's submenu has *Open in Terminal*, *Open in Finder*, and its path and session ID.
+- **Click a session** to jump to its exact terminal tab (iTerm2 and Terminal; VS Code and Cursor open the project window; other apps are brought to the front).
+- **Hold ⌥** to switch the rows to *Open in Finder*.
+- **Hover a session** for a tooltip with its full path, status, branch and terminal.
+- **Notifications:** when a session starts waiting for you, a notification appears. Click it to jump to that session. A dot that has been waiting for more than 2 minutes blinks.
+- The title shows up to 6 dots, then `+N`.
 
 ## How it works
 
@@ -53,6 +63,10 @@ SESSIONBAR_MARKETPLACE="$PWD" ./bin/sessionbar setup
 |---|---|
 | `sessionbar setup [dir]` | Install the Claude Code plugin and copy the SwiftBar plugin into SwiftBar's folder (or `dir`) |
 | `sessionbar status [--json]` | List active sessions in the terminal |
+| `sessionbar focus <id>` | Bring a session's terminal tab to the front |
+| `sessionbar open <id>` | Open a session's folder in Finder |
+| `sessionbar config [notify\|sound on\|off]` | Show or change settings (stored in `~/.config/sessionbar/config`) |
+| `sessionbar notify-test` | Send a test notification |
 | `sessionbar clean` | Remove state for sessions whose process is gone |
 | `sessionbar doctor` | Check the installation |
 | `sessionbar uninstall` | Remove both plugins and all state |
